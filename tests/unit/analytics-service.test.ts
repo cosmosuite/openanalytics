@@ -343,19 +343,61 @@ describe('performance percentile mapping', () => {
   })
 })
 
-describe('sub-hour timezone is a typed refusal, not a wrong answer', () => {
-  it('throws RESOLUTION_NOT_AVAILABLE and never calls the gateway', async () => {
+describe('sub-hour timezone reads raw events, and never a misaligned rollup', () => {
+  it('answers overview totals from analytics.overview_raw', async () => {
+    const { service, gateway } = serviceWith(() => [])
+    await service.overview({
+      siteId: SITE,
+      from: '2026-07-16T00:00:00.000Z',
+      to: '2026-07-23T00:00:00.000Z',
+      timezone: 'Asia/Kolkata',
+      compare: false,
+    })
+    // The operation is the assertion. `overview_hour` here would be the failure
+    // this whole path exists to prevent: a +05:30 request answered from UTC-hour
+    // buckets whose boundaries it does not share.
+    expect(gateway.calls.map((call) => call.operation)).toContain('analytics.overview_raw')
+    expect(gateway.calls.map((call) => call.operation)).not.toContain('analytics.overview_hour')
+  })
+
+  it('still refuses a sub-hour zone past the raw-scan cap, without calling the gateway', async () => {
     const { service, gateway } = serviceWith(() => [])
     await expect(
       service.overview({
         siteId: SITE,
-        from: '2026-07-16T00:00:00.000Z',
-        to: '2026-07-23T00:00:00.000Z',
+        // ~180 days: inside the hour cap, well past the 92-day raw cap.
+        from: '2026-01-01T00:00:00.000Z',
+        to: '2026-07-01T00:00:00.000Z',
         timezone: 'Asia/Kolkata',
         compare: false,
       }),
     ).rejects.toMatchObject({ code: 'RESOLUTION_NOT_AVAILABLE' })
     expect(gateway.calls).toHaveLength(0)
+  })
+
+  it('answers the top-N reports from their raw operations', async () => {
+    const { service, gateway } = serviceWith(() => [])
+    await service.pages({
+      siteId: SITE,
+      from: '2026-07-16T00:00:00.000Z',
+      to: '2026-07-23T00:00:00.000Z',
+      timezone: 'Asia/Kolkata',
+      limit: 100,
+    })
+    expect(gateway.calls.map((call) => call.operation)).toContain('analytics.pages_raw')
+    expect(gateway.calls.map((call) => call.operation)).not.toContain('analytics.pages_hour')
+  })
+
+  it('answers web vitals from raw events, which is where the rollup reads them', async () => {
+    const { service, gateway } = serviceWith(() => [])
+    await service.performance({
+      siteId: SITE,
+      from: '2026-07-16T00:00:00.000Z',
+      to: '2026-07-23T00:00:00.000Z',
+      timezone: 'Asia/Kolkata',
+      limit: 100,
+    })
+    expect(gateway.calls.map((call) => call.operation)).toContain('analytics.performance_raw')
   })
 })
 
@@ -443,12 +485,30 @@ describe('session metrics — finalized/provisional layering', () => {
     expect(res.layering.finalized_through).toBeNull()
   })
 
-  it('refuses a sub-hour timezone without reaching the gateway', async () => {
+  it('answers a sub-hour timezone from the session facts, never a rollup layer', async () => {
+    const { service, gateway } = serviceWith(() => [])
+    await service.sessions({
+      siteId: SITE,
+      ...range,
+      timezone: 'Asia/Kolkata',
+      finalizedThrough: null,
+    })
+    const operations = gateway.calls.map((call) => call.operation)
+    expect(operations).toContain('analytics.sessions_raw_day')
+    // The rollup layers bucket on UTC boundaries this zone does not share, so
+    // reaching either of them here would be the misattribution, not a fallback.
+    expect(operations).not.toContain('analytics.sessions_finalized_day')
+    expect(operations).not.toContain('analytics.sessions_finalized_day_local')
+  })
+
+  it('refuses a sub-hour timezone past the raw-scan cap, without reaching the gateway', async () => {
     const { service, gateway } = serviceWith(() => [])
     await expect(
       service.sessions({
         siteId: SITE,
-        ...range,
+        // ~180 days, past the 92-day raw cap.
+        from: '2026-01-01T00:00:00.000Z',
+        to: '2026-07-01T00:00:00.000Z',
         timezone: 'Asia/Kolkata',
         finalizedThrough: null,
       }),

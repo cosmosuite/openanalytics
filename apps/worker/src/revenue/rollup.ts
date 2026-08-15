@@ -82,7 +82,12 @@ import {
 
 const MS_PER_DAY = 86_400_000
 
-const UNITS: readonly RevenueRollupUnit[] = ['1h', '1d']
+// `'1m'` writes migration 0022's table in the same pass and the same generation
+// swap, from the same facts and the same plan. It is not an optimisation: it is
+// the only grain a sub-hour timezone can compose a local hour or day from, and
+// writing it here rather than deriving it at read time is what keeps one
+// implementation of the money rules.
+const UNITS: readonly RevenueRollupUnit[] = ['1h', '1d', '1m']
 
 export interface RevenueRollupDeps {
   readonly logger: Logger

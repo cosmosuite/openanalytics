@@ -27,6 +27,7 @@ import {
   importedReportOperationFor,
   operationParamsFor,
   overviewOperationFor,
+  RAW_REPORT_SLUGS,
   reportOperationFor,
   resolveAggregate,
   resolveRevenue,
@@ -445,7 +446,10 @@ export class AnalyticsService {
   // ---- Overview ---------------------------------------------------------
 
   async overview(req: AnalyticsOverviewRequest): Promise<Schemas['AnalyticsOverviewResponse']> {
-    const resolved = resolveAggregate(req)
+    // Raw-capable: `analytics.overview_raw` answers a sub-hour zone from
+    // `events_raw`, so these totals no longer refuse one. The top-N reports below
+    // still do — they have no raw operation yet.
+    const resolved = resolveAggregate(req, undefined, { rawCapable: true })
     if (!resolved.servable) this.#notServable(resolved.reason)
 
     const pointer = req.importPointer ?? null
@@ -718,7 +722,12 @@ export class AnalyticsService {
     rows: readonly Record<string, unknown>[]
     imported: readonly Record<string, unknown>[]
   }> {
-    const resolved = resolveAggregate(req)
+    // Raw-capable for every report that has a raw operation. `performance` does
+    // not — its web vitals are in `performance_events` — so it keeps refusing a
+    // sub-hour zone rather than reaching a source that cannot answer it.
+    const resolved = resolveAggregate(req, undefined, {
+      rawCapable: RAW_REPORT_SLUGS.has(slug),
+    })
     if (!resolved.servable) this.#notServable(resolved.reason)
 
     const pointer = req.importPointer ?? null

@@ -49,6 +49,7 @@ const MS_PER_DAY = 86_400_000
 const MAX_SPAN_MINUTE_MS = CONFIG.MAX_SPAN_MINUTE_HOURS * MS_PER_HOUR
 const MAX_SPAN_HOUR_MS = CONFIG.MAX_SPAN_HOUR_DAYS * MS_PER_DAY
 const MAX_SPAN_DAY_MS = CONFIG.MAX_SPAN_DAY_DAYS * MS_PER_DAY
+const MAX_SPAN_RAW_MS = CONFIG.MAX_SPAN_RAW_DAYS * MS_PER_DAY
 
 /** Bounds on a top-N report's row count. */
 const TOP_N_DEFAULT = 100
@@ -383,7 +384,49 @@ const maxRangeFor: Record<RollupResolution, number> = {
   '1m': MAX_SPAN_MINUTE_MS,
   '1h': MAX_SPAN_HOUR_MS,
   '1d': MAX_SPAN_DAY_MS,
+  raw: MAX_SPAN_RAW_MS,
 }
+
+/**
+ * The live range filter for a raw operation.
+ *
+ * `RANGE_FILTER` above names `bucket_start`, which only a rollup has. Raw rows
+ * carry `occurred_at`, and the comparison is against the same bound instants —
+ * so this is that filter with the column swapped and nothing else changed.
+ *
+ * There is deliberately no `ingest_generation` predicate. A site reset or
+ * deletion runs `ALTER … DELETE` over `events_raw` *and* every rollup in the same
+ * phase list (`packages/domain/src/deletion.ts`), so raw and rolled-up reads see
+ * exactly the same rows. Filtering on generation here would not make a raw read
+ * safer; it would make it disagree with the rollup path about a site that had
+ * been reset, which is the harder bug to find.
+ */
+/**
+ * The visitor identity, as every rollup's materialized view defines it
+ * (migrations 0005-0011: `uniqState(if(user_id != '', user_id, anonymous_id))`).
+ *
+ * Named once here for the same reason migration 0005 gives for naming it once
+ * per file: "this same expression is used by every rollup that carries visitors,
+ * so the definition lives in one place and never diverges between tables." A raw
+ * operation computing `uniq(anonymous_id)` instead would silently disagree with
+ * the rollup path for every identified visitor — the same person counted twice
+ * across an identify() boundary — and disagree only on sites that call
+ * identify(), which is the kind of divergence that surfaces as a support ticket
+ * rather than a test failure.
+ */
+const RAW_VISITOR_IDENTITY = "if(t.user_id != '', t.user_id, t.anonymous_id)"
+
+const RAW_RANGE_FILTER = [
+  'WHERE t.site_id = {site_id:UUID}',
+  "  AND t.occurred_at >= toDateTime64({from:String}, 3, 'UTC')",
+  "  AND t.occurred_at < toDateTime64({to:String}, 3, 'UTC')",
+].join('\n')
+
+// A local bucket expression — `toStartOfHour(toTimeZone(t.occurred_at, {tz:String}))`
+// and its day/week siblings — belongs here when the raw *timeseries* operations
+// land. It is deliberately absent until then: `overview_raw` is a range total with
+// no bucket to label, so a helper written for callers that do not exist yet would
+// be untested SQL sitting in the registry's path.
 
 // ---------------------------------------------------------------------------
 // Timeseries operations (the metrics chart: events, pageviews, visitors / time)
@@ -402,6 +445,8 @@ function defineTimeseries(definition: {
   id: string
   table: string
   source: RollupResolution
+  /** Read `events_raw` instead of a rollup — the sub-hour zone's chart. */
+  rawEvents?: boolean
   /**
    * Group key. `bucket_start` reads pre-bucketed rows; a `toStartOf*` call
    * re-buckets to a timezone-local grain. Must be a constant expression.
@@ -426,32 +471,53 @@ function defineTimeseries(definition: {
   const zone = definition.withTimezone ? '{tz:String}' : "'UTC'"
   const imported = definition.importedBucketExpr
 
-  const liveBranch = [
-    'SELECT',
-    `  ${definition.bucketExpr} AS bucket,`,
-    '  sum(t.events) AS events,',
-    "  sumIf(t.events, t.event_type = 'page_view') AS pageviews,",
-    // The merge is filtered to the same population `pageviews` counts — the
-    // contract sentence this implements is `OverviewTotals.visitors` in
-    // openapi.yaml (ADR-0036): a bucket's visitors are the distinct anonymous
-    // ids with at least one page view IN THAT BUCKET, so visitors <= pageviews
-    // on every point. A bare `uniqMerge` also counted the states under every
-    // other event_type, where a departure beacon landing in the next bucket
-    // made a "visitor" with zero pageviews, and where the identify-typed state
-    // holds the user_id half of an identified person the page_view state
-    // already counts as their anonymous id.
-    "  uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors",
-    `FROM ${definition.table} AS t`,
-    RANGE_FILTER,
-    // **Every timeseries takes the cutover, including the ones with no imported
-    // branch.** A minute or hour chart cannot show imported data honestly — an
-    // aggregate-only export has no sub-day grain — but it must not show live data
-    // the day chart is hiding either: two charts of the same range disagreeing
-    // about whether the pre-cutover days exist is worse than one of them being
-    // empty, and the empty one is at least explained by `estimated`.
-    `  AND t.bucket_start >= ${cutoverBoundary(zone)}`,
-    'GROUP BY bucket',
-  ].join('\n')
+  // A rollup re-buckets its own `bucket_start`, which is why it reaches only a
+  // whole-hour offset; raw cuts the bucket from `occurred_at`, which is exact for
+  // any whole-minute one. That is the whole difference between these branches.
+  const liveBranch = (
+    definition.rawEvents === true
+      ? [
+          'SELECT',
+          `  ${definition.bucketExpr} AS bucket,`,
+          '  count() AS events,',
+          "  countIf(t.type = 'page_view') AS pageviews,",
+          // Same population and same contract sentence as the rollup branch's
+          // `uniqMergeIf` below — counted from rows rather than merged from a
+          // stored state, over the resolved identity so both paths agree for an
+          // identified visitor.
+          `  uniqIf(${RAW_VISITOR_IDENTITY}, t.type = 'page_view') AS visitors`,
+          `FROM ${definition.table} AS t`,
+          RAW_RANGE_FILTER,
+          `  AND t.occurred_at >= ${cutoverBoundary(zone)}`,
+          'GROUP BY bucket',
+        ]
+      : [
+          'SELECT',
+          `  ${definition.bucketExpr} AS bucket,`,
+          '  sum(t.events) AS events,',
+          "  sumIf(t.events, t.event_type = 'page_view') AS pageviews,",
+          // The merge is filtered to the same population `pageviews` counts — the
+          // contract sentence this implements is `OverviewTotals.visitors` in
+          // openapi.yaml (ADR-0036): a bucket's visitors are the distinct anonymous
+          // ids with at least one page view IN THAT BUCKET, so visitors <= pageviews
+          // on every point. A bare `uniqMerge` also counted the states under every
+          // other event_type, where a departure beacon landing in the next bucket
+          // made a "visitor" with zero pageviews, and where the identify-typed state
+          // holds the user_id half of an identified person the page_view state
+          // already counts as their anonymous id.
+          "  uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors",
+          `FROM ${definition.table} AS t`,
+          RANGE_FILTER,
+          // **Every timeseries takes the cutover, including the ones with no imported
+          // branch.** A minute or hour chart cannot show imported data honestly — an
+          // aggregate-only export has no sub-day grain — but it must not show live data
+          // the day chart is hiding either: two charts of the same range disagreeing
+          // about whether the pre-cutover days exist is worse than one of them being
+          // empty, and the empty one is at least explained by `estimated`.
+          `  AND t.bucket_start >= ${cutoverBoundary(zone)}`,
+          'GROUP BY bucket',
+        ]
+  ).join('\n')
 
   const sql =
     imported === undefined
@@ -499,6 +565,7 @@ function defineTimeseries(definition: {
     id: definition.id,
     summary: definition.summary,
     requiresSiteScope: true,
+    ...(definition.rawEvents === true ? { allowRawEvents: true } : {}),
     params: rangeParamsSchema({
       maxRangeMs: maxRangeFor[definition.source],
       alignment: definition.alignment,
@@ -539,6 +606,49 @@ const timeseriesOperations: readonly QueryOperation[] = [
     alignment: 'hour',
     withTimezone: true,
     maxRows: 1_000,
+  }),
+  // The sub-hour zone's chart, at the three grains the ladder can pick for it.
+  // No imported branch on any of them: `importedBucketExpr` exists so a provider's
+  // daily total can be placed beside live days, and a sub-hour site reaching the
+  // import is a separate question from reaching its own numbers — one it can ask
+  // once the import path has a local-day placement that does not assume the
+  // placement lands on a UTC hour.
+  defineTimeseries({
+    id: 'analytics.timeseries_raw_hour',
+    summary:
+      'Events, pageviews and unique visitors per local hour from raw events (sub-hour zone).',
+    table: 'events_raw',
+    source: 'raw',
+    rawEvents: true,
+    bucketExpr: bucketUtc('toStartOfHour(t.occurred_at, {tz:String})'),
+    alignment: 'minute',
+    withTimezone: true,
+    maxRows: 2_500,
+  }),
+  defineTimeseries({
+    id: 'analytics.timeseries_raw_day',
+    summary: 'Events, pageviews and unique visitors per local day from raw events (sub-hour zone).',
+    table: 'events_raw',
+    source: 'raw',
+    rawEvents: true,
+    bucketExpr: bucketUtc('toStartOfDay(t.occurred_at, {tz:String})'),
+    alignment: 'minute',
+    withTimezone: true,
+    maxRows: 500,
+  }),
+  defineTimeseries({
+    id: 'analytics.timeseries_raw_week',
+    summary:
+      'Events, pageviews and unique visitors per local ISO week from raw events (sub-hour zone).',
+    table: 'events_raw',
+    source: 'raw',
+    rawEvents: true,
+    // toStartOfWeek returns a Date; toDateTime turns that local Monday midnight
+    // back into the instant it is, before the usual UTC relabelling.
+    bucketExpr: bucketUtc('toDateTime(toStartOfWeek(t.occurred_at, 1, {tz:String}), {tz:String})'),
+    alignment: 'minute',
+    withTimezone: true,
+    maxRows: 200,
   }),
   defineTimeseries({
     id: 'analytics.timeseries_day',
@@ -650,21 +760,55 @@ function defineOverview(definition: {
   source: RollupResolution
   alignment: RangeAlignment
   summary: string
+  /**
+   * Set only by `analytics.overview_raw`, and it is a deliberate exception to
+   * §15's "additive analytics reads a rollup only" — which names `overview`.
+   *
+   * The rule exists so a dashboard card cannot quietly become an unbounded scan of
+   * the event table. That is the cost being guarded, not raw access itself: the
+   * funnel operation already reads `events_raw` under the conditions §15 sets for
+   * it — site-scoped, bounded, capped — and this operation meets the same three.
+   * It binds `{site_id:UUID}`, its span is capped at `MAX_SPAN_RAW_DAYS` (92d,
+   * the tightest cap in the config), and it returns one row.
+   *
+   * What it buys is the only honest answer available to a sub-hour zone: no rollup
+   * bucket can be split on a +05:30 local boundary, so the alternative to this
+   * scan is not a cheaper number, it is a wrong one or none at all. If the
+   * maintainers would rather have a locally-bucketed rollup family than an
+   * exception here, this operation is the thing to delete.
+   */
+  allowRawEvents?: boolean
 }): QueryOperation {
-  const liveBranch = [
-    'SELECT',
-    '  sum(t.events) AS events,',
-    "  sumIf(t.events, t.event_type = 'page_view') AS pageviews,",
-    '  sum(t.billable_events) AS billable_events,',
-    // Same filter and same reason as the timeseries live branch above: the
-    // `OverviewTotals.visitors` contract sentence (ADR-0036) — the range's
-    // visitors are the distinct anonymous ids with at least one page view in
-    // it, the population `pageviews` already counts.
-    "  uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors",
-    `FROM ${definition.table} AS t`,
-    RANGE_FILTER,
-    `  AND t.bucket_start >= ${cutoverBoundary('{tz:String}')}`,
-  ].join('\n')
+  // The raw branch counts rows where the rollup branch sums pre-aggregated
+  // measures, and computes `uniq` directly where the rollup merges a stored
+  // `uniq` state. Same estimator, same measures, same contract sentence — the
+  // only difference is that nothing has been aggregated yet.
+  const liveBranch =
+    definition.source === 'raw'
+      ? [
+          'SELECT',
+          '  count() AS events,',
+          "  countIf(t.type = 'page_view') AS pageviews,",
+          '  countIf(t.billable = 1) AS billable_events,',
+          `  uniqIf(${RAW_VISITOR_IDENTITY}, t.type = 'page_view') AS visitors`,
+          `FROM ${definition.table} AS t`,
+          RAW_RANGE_FILTER,
+          `  AND t.occurred_at >= ${cutoverBoundary('{tz:String}')}`,
+        ].join('\n')
+      : [
+          'SELECT',
+          '  sum(t.events) AS events,',
+          "  sumIf(t.events, t.event_type = 'page_view') AS pageviews,",
+          '  sum(t.billable_events) AS billable_events,',
+          // Same filter and same reason as the timeseries live branch above: the
+          // `OverviewTotals.visitors` contract sentence (ADR-0036) — the range's
+          // visitors are the distinct anonymous ids with at least one page view in
+          // it, the population `pageviews` already counts.
+          "  uniqMergeIf(t.visitors, t.event_type = 'page_view') AS visitors",
+          `FROM ${definition.table} AS t`,
+          RANGE_FILTER,
+          `  AND t.bucket_start >= ${cutoverBoundary('{tz:String}')}`,
+        ].join('\n')
 
   const sql = [
     'SELECT',
@@ -711,6 +855,7 @@ function defineOverview(definition: {
     }),
     sql,
     maxRows: 1,
+    ...(definition.allowRawEvents === true ? { allowRawEvents: true } : {}),
     bind: (params: Record<string, unknown>) => ({
       site_id: params['site_id'] as string,
       from: toClickHouseInstant(params['from'] as string),
@@ -738,6 +883,18 @@ const overviewOperations: readonly QueryOperation[] = [
     table: 'metrics_1d',
     source: '1d',
     alignment: 'day',
+  }),
+  // The sub-hour zone's totals. Minute alignment because a raw read filters on
+  // instants and has no bucket boundary to respect — the endpoints are snapped to
+  // the minute only so the effective range the api reports back is a clean one.
+  defineOverview({
+    id: 'analytics.overview_raw',
+    summary:
+      'Range totals from raw events, for a sub-hour timezone offset no hour/day rollup can align to (plus the published import).',
+    table: 'events_raw',
+    source: 'raw',
+    alignment: 'minute',
+    allowRawEvents: true,
   }),
 ]
 
@@ -771,16 +928,34 @@ function defineReport(definition: {
    */
   withImport: boolean
   summary: string
+  /**
+   * Read `events_raw` rather than a rollup — the sub-hour zone's only source, and
+   * the same §15 exception `analytics.overview_raw` documents at length. The
+   * conditions §15 attaches to a raw read hold here too: site-scoped, capped at
+   * `MAX_SPAN_RAW_DAYS`, and `LIMIT {limit:UInt32}` on top of that.
+   */
+  rawEvents?: boolean
+  /** Extra live predicate — see the `rawFilter` note in the SQL below. */
+  rawFilter?: string
 }): QueryOperation {
   const selectList = [...definition.dimensions, ...definition.measures]
+  const raw = definition.rawEvents === true
   const sql = [
     'SELECT',
     selectList
       .map((column, index) => `  ${column}${index === selectList.length - 1 ? '' : ','}`)
       .join('\n'),
     `FROM ${definition.table} AS t`,
-    RANGE_FILTER,
-    ...(definition.withImport ? [`  AND t.bucket_start >= ${cutoverBoundary('{tz:String}')}`] : []),
+    raw ? RAW_RANGE_FILTER : RANGE_FILTER,
+    // The rollup tables hold only the rows their family counts — `pages_1h` is
+    // page views and nothing else. `events_raw` holds every event, so a raw
+    // report has to re-apply the predicate the rollup's materialized view
+    // applied at write time, or a click event carrying a `page_path` becomes a
+    // zero-view row in the pages table.
+    ...(definition.rawFilter !== undefined ? [`  AND ${definition.rawFilter}`] : []),
+    ...(definition.withImport
+      ? [`  AND t.${raw ? 'occurred_at' : 'bucket_start'} >= ${cutoverBoundary('{tz:String}')}`]
+      : []),
     `GROUP BY ${definition.dimensions.join(', ')}`,
     `ORDER BY ${definition.orderBy} DESC`,
     'LIMIT {limit:UInt32}',
@@ -803,6 +978,7 @@ function defineReport(definition: {
     }),
     sql,
     maxRows: TOP_N_MAX,
+    ...(raw ? { allowRawEvents: true } : {}),
     bind: (params: Record<string, unknown>) => ({
       site_id: params['site_id'] as string,
       from: toClickHouseInstant(params['from'] as string),
@@ -908,6 +1084,83 @@ const REPORT_SHAPES: readonly ReportShape[] = [
   },
 ]
 
+/**
+ * The raw-source form of a report shape, for a sub-hour zone.
+ *
+ * Keyed by slug rather than added to `ReportShape`, because five of the six have
+ * one and `performance` cannot: web vitals are written to `performance_events`,
+ * a different table with a different grain, so there is nothing in `events_raw`
+ * to read. That report keeps refusing a sub-hour zone, and the absence here is
+ * what says so.
+ *
+ * The measures are the rollups' own definitions unwound by one step: where the
+ * rollup sums a stored `views` and merges a stored `uniq` state, this counts the
+ * rows that produced them and computes `uniq` over the same population. Same
+ * estimator, same filter, one fewer layer.
+ */
+const RAW_REPORT_SHAPES: Readonly<
+  Record<string, { dimensions: readonly string[]; measures: readonly string[]; filter?: string }>
+> = {
+  pages: {
+    dimensions: ['t.page_path AS page_path'],
+    measures: ['count() AS views', `uniq(${RAW_VISITOR_IDENTITY}) AS visitors`],
+    filter: "t.type = 'page_view'",
+  },
+  sources: {
+    dimensions: [
+      't.referrer_domain AS referrer_domain',
+      't.utm_source AS utm_source',
+      't.utm_medium AS utm_medium',
+      't.utm_campaign AS utm_campaign',
+    ],
+    measures: ['count() AS views', `uniq(${RAW_VISITOR_IDENTITY}) AS visitors`],
+    filter: "t.type = 'page_view'",
+  },
+  geography: {
+    dimensions: ['t.country AS country', 't.city AS city'],
+    measures: ['count() AS views', `uniq(${RAW_VISITOR_IDENTITY}) AS visitors`],
+    filter: "t.type = 'page_view'",
+  },
+  devices: {
+    dimensions: ['t.device_type AS device_type', 't.browser AS browser', 't.os AS os'],
+    measures: ['count() AS views', `uniq(${RAW_VISITOR_IDENTITY}) AS visitors`],
+    filter: "t.type = 'page_view'",
+  },
+  custom_events: {
+    // `event_name`/`event_type` are the rollup's names for raw's `name`/`type`.
+    dimensions: ['t.name AS event_name', 't.type AS event_type'],
+    measures: [
+      'count() AS events',
+      'countIf(t.billable = 1) AS billable_events',
+      `uniq(${RAW_VISITOR_IDENTITY}) AS visitors`,
+    ],
+    // `custom_events_1h_mv` is `WHERE name != ''`. Without it every page view —
+    // which carries no name — becomes an unlabelled row with a large count, which
+    // is exactly what the blank rows in the Custom events card were.
+    filter: "t.name != ''",
+  },
+  // Web vitals are `events_raw` rows too — `type = 'web_vital'`, with the metric,
+  // value and rating inside `properties` — which is exactly what
+  // `performance_1h_mv` reads. The only difference from the rollup is the
+  // t-digest: it stores a `quantilesTDigestState` to merge across buckets, and
+  // this builds the digest from the values directly.
+  performance: {
+    dimensions: [
+      "JSONExtractString(t.properties, 'oa_metric') AS metric",
+      't.device_type AS device_type',
+    ],
+    measures: [
+      'count() AS samples',
+      "sum(JSONExtractFloat(t.properties, 'oa_value')) AS value_sum",
+      "quantilesTDigest(0.5, 0.75, 0.9, 0.95, 0.99)(JSONExtractFloat(t.properties, 'oa_value')) AS percentiles",
+      "countIf(JSONExtractString(t.properties, 'oa_rating') = 'good') AS good_samples",
+      "countIf(JSONExtractString(t.properties, 'oa_rating') = 'needs-improvement') AS needs_improvement_samples",
+      "countIf(JSONExtractString(t.properties, 'oa_rating') = 'poor') AS poor_samples",
+    ],
+    filter: "t.type = 'web_vital' AND JSONExtractString(t.properties, 'oa_metric') != ''",
+  },
+}
+
 const reportOperations: readonly QueryOperation[] = REPORT_SHAPES.flatMap((shape) => [
   defineReport({
     id: `analytics.${shape.slug}_hour`,
@@ -931,6 +1184,27 @@ const reportOperations: readonly QueryOperation[] = REPORT_SHAPES.flatMap((shape
     withImport: shape.imported,
     summary: `${shape.summary} UTC-day rollup.`,
   }),
+  ...(RAW_REPORT_SHAPES[shape.slug] === undefined
+    ? []
+    : [
+        defineReport({
+          id: `analytics.${shape.slug}_raw`,
+          table: 'events_raw',
+          source: 'raw',
+          // Instants, not buckets: a sub-hour local midnight lands mid-hour, which
+          // is the endpoint the hour operation's alignment check rejects.
+          alignment: 'minute',
+          dimensions: RAW_REPORT_SHAPES[shape.slug]!.dimensions,
+          measures: RAW_REPORT_SHAPES[shape.slug]!.measures,
+          orderBy: shape.orderBy,
+          withImport: shape.imported,
+          rawEvents: true,
+          ...(RAW_REPORT_SHAPES[shape.slug]!.filter === undefined
+            ? {}
+            : { rawFilter: RAW_REPORT_SHAPES[shape.slug]!.filter }),
+          summary: `${shape.summary} Raw events, for a sub-hour timezone offset.`,
+        }),
+      ]),
 ])
 
 // ---------------------------------------------------------------------------
@@ -1403,6 +1677,34 @@ const sessionOperations: readonly QueryOperation[] = [
     bucketExpr: bucketUtc('toStartOfDay(cur.session_start, {tz:String})'),
     source: '1h',
     alignment: 'hour',
+    withTimezone: true,
+    maxRows: 500,
+  }),
+  // The sub-hour zone's two grains.
+  //
+  // Identical SQL to the two above — the bucket expression was always
+  // timezone-aware and always read `session_facts_versions`, which stores
+  // `session_start` as an instant. The *only* thing that refused a sub-hour zone
+  // here was `alignment: 'hour'`, rejecting a local midnight that lands mid-hour.
+  // So this is the same query under a minute-aligned range and the raw span cap,
+  // not a reimplementation of anything.
+  defineSessionProvisional({
+    id: 'analytics.sessions_raw_hour',
+    summary:
+      'Session totals per timezone-local hour from session_facts_versions, for a sub-hour timezone offset.',
+    bucketExpr: bucketUtc('toStartOfHour(cur.session_start, {tz:String})'),
+    source: 'raw',
+    alignment: 'minute',
+    withTimezone: true,
+    maxRows: 2_500,
+  }),
+  defineSessionProvisional({
+    id: 'analytics.sessions_raw_day',
+    summary:
+      'Session totals per timezone-local day from session_facts_versions, for a sub-hour timezone offset.',
+    bucketExpr: bucketUtc('toStartOfDay(cur.session_start, {tz:String})'),
+    source: 'raw',
+    alignment: 'minute',
     withTimezone: true,
     maxRows: 500,
   }),
@@ -2525,6 +2827,45 @@ const revenueOperations: readonly QueryOperation[] = [
     table: 'revenue_1h',
     source: '1h',
     alignment: 'hour',
+  }),
+  // The sub-hour zone's three revenue operations, all reading migration 0022's
+  // minute rollup. They need no `allowRawEvents`: `revenue_1m` is a rollup like
+  // its hourly sibling, written by the same finalizer pass from the same plan —
+  // §15's raw-table rule is not in play here at all.
+  //
+  // `source: 'raw'` names the **span cap** and not the table. The minute cap
+  // (48h) belongs to `metrics_1m`, which holds a row per active minute of page
+  // views; `revenue_1m` holds a row only for a minute that moved money, so a
+  // quarter of it is smaller than a day of the former. The raw cap
+  // (MAX_SPAN_RAW_DAYS, 92d) is the bound that actually fits, and it is also the
+  // bound every other sub-hour surface already reports, so a viewer does not get
+  // one refusal window for the chart and a different one for the money.
+  defineRevenueTimeseries({
+    id: 'analytics.revenue_timeseries_hour_1m',
+    summary: 'Revenue totals per timezone-local hour, composed from revenue_1m (sub-hour zone).',
+    table: 'revenue_1m',
+    bucketExpr: bucketUtc('toStartOfHour(cur.bucket_start, {tz:String})'),
+    source: 'raw',
+    alignment: 'minute',
+    withTimezone: true,
+    maxRows: 2_500,
+  }),
+  defineRevenueTimeseries({
+    id: 'analytics.revenue_timeseries_day_1m',
+    summary: 'Revenue totals per timezone-local day, composed from revenue_1m (sub-hour zone).',
+    table: 'revenue_1m',
+    bucketExpr: bucketUtc('toStartOfDay(cur.bucket_start, {tz:String})'),
+    source: 'raw',
+    alignment: 'minute',
+    withTimezone: true,
+    maxRows: 500,
+  }),
+  defineRevenueSummary({
+    id: 'analytics.revenue_summary_1m',
+    summary: 'Revenue totals over a range, read from revenue_1m (sub-hour zone).',
+    table: 'revenue_1m',
+    source: 'raw',
+    alignment: 'minute',
   }),
   defineRevenueSummary({
     id: 'analytics.revenue_summary_day',

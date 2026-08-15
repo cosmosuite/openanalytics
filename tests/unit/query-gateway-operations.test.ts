@@ -67,13 +67,16 @@ describe('operation registry', () => {
       'analytics.custom_event_samples_hour',
       'analytics.custom_events_day',
       'analytics.custom_events_hour',
+      'analytics.custom_events_raw',
       'analytics.devices_day',
       'analytics.devices_hour',
+      'analytics.devices_raw',
       'analytics.freshness',
       'analytics.funnel_session',
       'analytics.funnel_visitor',
       'analytics.geography_day',
       'analytics.geography_hour',
+      'analytics.geography_raw',
       // The seven imported-only breakdowns (ADR-0032, D2b). They exist because a
       // blank-padded SQL union would fabricate dimension tuples; the api merges
       // their rows onto the live report's instead.
@@ -86,10 +89,13 @@ describe('operation registry', () => {
       'analytics.imported_sources',
       'analytics.overview_day',
       'analytics.overview_hour',
+      'analytics.overview_raw',
       'analytics.pages_day',
       'analytics.pages_hour',
+      'analytics.pages_raw',
       'analytics.performance_day',
       'analytics.performance_hour',
+      'analytics.performance_raw',
       'analytics.recent_visitors',
       // The revenue read surface (ADR-0033, D7; CP5). Two bucket families over
       // the 0018 rollups, two object families over the 0016/0017 facts, and the
@@ -97,11 +103,14 @@ describe('operation registry', () => {
       // bucket cannot carry a currency dimension without breaking its own unit
       // of replacement.
       'analytics.revenue_order_objects',
+      'analytics.revenue_summary_1m',
       'analytics.revenue_summary_day',
       'analytics.revenue_summary_hour',
       'analytics.revenue_timeseries_day',
+      'analytics.revenue_timeseries_day_1m',
       'analytics.revenue_timeseries_day_local',
       'analytics.revenue_timeseries_hour',
+      'analytics.revenue_timeseries_hour_1m',
       'analytics.revenue_transaction_journey',
       'analytics.revenue_transactions',
       'analytics.revenue_unconverted',
@@ -111,12 +120,18 @@ describe('operation registry', () => {
       'analytics.sessions_provisional_day',
       'analytics.sessions_provisional_day_local',
       'analytics.sessions_provisional_hour',
+      'analytics.sessions_raw_day',
+      'analytics.sessions_raw_hour',
       'analytics.sources_day',
       'analytics.sources_hour',
+      'analytics.sources_raw',
       'analytics.timeseries_day',
       'analytics.timeseries_day_utc',
       'analytics.timeseries_hour',
       'analytics.timeseries_minute',
+      'analytics.timeseries_raw_day',
+      'analytics.timeseries_raw_hour',
+      'analytics.timeseries_raw_week',
       'analytics.timeseries_week',
       'analytics.timeseries_week_utc',
       'analytics.visitor_revenue',
@@ -146,6 +161,27 @@ describe('operation registry', () => {
       // subquery (ADR-0036 CP7): the identify() hashes an anonymous id paired
       // inside the window, which only events_raw can answer.
       'analytics.visitor_revenue_entries',
+      // The sub-hour zone's range totals. §15's rule names `overview`, and this is
+      // the documented exception to it rather than a hole in it: a +05:30 local
+      // boundary falls inside a UTC-hour bucket that cannot be split, so no rollup
+      // can answer this zone at all. Bounded, site-scoped and capped on the same
+      // terms as the funnel — MAX_SPAN_RAW_DAYS (92d) and one row — which is what
+      // the rule is actually protecting.
+      'analytics.overview_raw',
+      // The same exception, one per top-N family — `performance` included, since
+      // `performance_1h_mv` itself reads `events_raw WHERE type = 'web_vital'`
+      // and lifts the metric, value and rating out of `properties`. Its raw
+      // operation reads exactly what the rollup was built from.
+      'analytics.pages_raw',
+      'analytics.sources_raw',
+      'analytics.geography_raw',
+      'analytics.devices_raw',
+      'analytics.custom_events_raw',
+      'analytics.performance_raw',
+      // The chart's three grains, same exception and same reason.
+      'analytics.timeseries_raw_hour',
+      'analytics.timeseries_raw_day',
+      'analytics.timeseries_raw_week',
     ])
     for (const operation of QUERY_OPERATIONS.values()) {
       if (rawReaders.has(operation.id)) {
@@ -220,6 +256,8 @@ describe('operation registry', () => {
     }
     for (const id of [
       'analytics.sessions_provisional_hour',
+      'analytics.sessions_raw_day',
+      'analytics.sessions_raw_hour',
       'analytics.sessions_provisional_day',
       'analytics.sessions_provisional_day_local',
     ]) {
@@ -464,6 +502,9 @@ describe('the import partition (ADR-0032, D2b/D4)', () => {
     // of them being empty, and the empty one is explained by `estimated`.
     for (const id of [
       'analytics.timeseries_minute',
+      'analytics.timeseries_raw_day',
+      'analytics.timeseries_raw_hour',
+      'analytics.timeseries_raw_week',
       'analytics.timeseries_hour',
       'analytics.timeseries_day',
       'analytics.timeseries_day_utc',
@@ -471,6 +512,7 @@ describe('the import partition (ADR-0032, D2b/D4)', () => {
       'analytics.timeseries_week_utc',
       'analytics.overview_hour',
       'analytics.overview_day',
+      'analytics.overview_raw',
     ]) {
       expect(importAware, id).toContain(id)
     }
@@ -714,10 +756,13 @@ describe('timezone binding', () => {
     expect(timezoneOperations.map((operation) => operation.id).sort()).toEqual([
       'analytics.custom_events_day',
       'analytics.custom_events_hour',
+      'analytics.custom_events_raw',
       'analytics.devices_day',
       'analytics.devices_hour',
+      'analytics.devices_raw',
       'analytics.geography_day',
       'analytics.geography_hour',
+      'analytics.geography_raw',
       'analytics.imported_browsers',
       'analytics.imported_custom_events',
       'analytics.imported_devices',
@@ -727,19 +772,29 @@ describe('timezone binding', () => {
       'analytics.imported_sources',
       'analytics.overview_day',
       'analytics.overview_hour',
+      'analytics.overview_raw',
       'analytics.pages_day',
       'analytics.pages_hour',
+      'analytics.pages_raw',
+      'analytics.revenue_timeseries_day_1m',
       'analytics.revenue_timeseries_day_local',
       'analytics.revenue_timeseries_hour',
+      'analytics.revenue_timeseries_hour_1m',
       'analytics.sessions_finalized_day_local',
       'analytics.sessions_finalized_hour',
       'analytics.sessions_provisional_day_local',
       'analytics.sessions_provisional_hour',
+      'analytics.sessions_raw_day',
+      'analytics.sessions_raw_hour',
       'analytics.sources_day',
       'analytics.sources_hour',
+      'analytics.sources_raw',
       'analytics.timeseries_day',
       'analytics.timeseries_hour',
       'analytics.timeseries_minute',
+      'analytics.timeseries_raw_day',
+      'analytics.timeseries_raw_hour',
+      'analytics.timeseries_raw_week',
       'analytics.timeseries_week',
     ])
 

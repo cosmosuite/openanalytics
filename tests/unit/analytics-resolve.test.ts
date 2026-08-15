@@ -68,13 +68,16 @@ describe('resolveTimeseries', () => {
     expect(r.withTimezone).toBe(true)
   })
 
-  it('refuses a sub-hour zone at hour grain', () => {
+  it('serves a sub-hour zone at hour grain from raw events', () => {
     const r = resolveTimeseries({
       from: '2026-07-16T00:00:00.000Z',
       to: '2026-07-23T00:00:00.000Z',
       timezone: KOLKATA,
     })
-    expect(r.servable).toBe(false)
+    expect(r.servable).toBe(true)
+    if (!r.servable) return
+    expect(r.operation).toBe('analytics.timeseries_raw_hour')
+    expect(r.sourceRollup).toBe('raw')
   })
 })
 
@@ -132,11 +135,12 @@ describe('resolveTimeseries with a forced resolution', () => {
     ).toBeNull()
   })
 
-  it('serves hour for UTC and whole-hour zones up to the 400d cap, never for a sub-hour zone', () => {
+  it('serves hour from the rollup for UTC and whole-hour zones, from raw for a sub-hour one', () => {
     for (const range of [SHORT, QUARTER]) {
       expect(operationFor(range, 'UTC', 'hour')).toBe('analytics.timeseries_hour')
       expect(operationFor(range, ISTANBUL, 'hour')).toBe('analytics.timeseries_hour')
-      expect(operationFor(range, KATHMANDU, 'hour')).toBeNull()
+      // Never the rollup operation: its buckets are UTC hours +05:45 does not share.
+      expect(operationFor(range, KATHMANDU, 'hour')).toBe('analytics.timeseries_raw_hour')
     }
     // Past the hour rollup's own scan cap, no zone can force it.
     expect(operationFor(LONG, 'UTC', 'hour')).toBeNull()
@@ -154,7 +158,10 @@ describe('resolveTimeseries with a forced resolution', () => {
     // though a UTC day of the same length is fine.
     expect(operationFor(LONG, ISTANBUL, 'day')).toBeNull()
     expect(operationFor(HUGE, 'UTC', 'day')).toBeNull()
-    expect(operationFor(QUARTER, KATHMANDU, 'day')).toBeNull()
+    // A sub-hour zone reads raw inside the 92-day cap, and is refused past it —
+    // a tighter bound than the 400d the composed-day path gets.
+    expect(operationFor(QUARTER, KATHMANDU, 'day')).toBe('analytics.timeseries_raw_day')
+    expect(operationFor(LONG, KATHMANDU, 'day')).toBeNull()
   })
 
   it('serves week from the same sources as day, under the same class rules', () => {
@@ -179,18 +186,23 @@ describe('resolveTimeseries with a forced resolution', () => {
     expect(operationFor(LONG, ISTANBUL, 'week')).toBeNull()
     expect(operationFor(LONG, 'UTC', 'week')).toBe('analytics.timeseries_week_utc')
     expect(operationFor(HUGE, 'UTC', 'week')).toBeNull()
+    // Week is the one grain a sub-hour zone gains outright: there was never a
+    // week rollup for it to miss, and raw groups the local Monday directly.
     for (const range of [SHORT, QUARTER]) {
-      expect(operationFor(range, KATHMANDU, 'week')).toBeNull()
+      expect(operationFor(range, KATHMANDU, 'week')).toBe('analytics.timeseries_raw_week')
     }
+    expect(operationFor(LONG, KATHMANDU, 'week')).toBeNull()
   })
 
   it('names the reason a forced grain was refused, precisely enough to act on', () => {
-    const subHour = resolveTimeseries({ ...QUARTER, timezone: KATHMANDU, resolution: 'week' })
+    // Past the raw cap, so the refusal names the cap rather than the zone class:
+    // the zone is servable, this range is not.
+    const subHour = resolveTimeseries({ ...LONG, timezone: KATHMANDU, resolution: 'week' })
     expect(subHour.servable).toBe(false)
     if (subHour.servable) return
     expect(subHour.alignment).toBe('sub-hour')
     expect(subHour.reason).toMatch(/week/)
-    expect(subHour.reason).toMatch(/sub-hour/)
+    expect(subHour.reason).toMatch(/raw-scan cap/)
 
     const tooLong = resolveTimeseries({ ...LONG, timezone: ISTANBUL, resolution: 'week' })
     expect(tooLong.servable).toBe(false)
@@ -426,14 +438,45 @@ describe('resolveSession (finalized + provisional layer operations)', () => {
     expect(r.withTimezone).toBe(true)
   })
 
-  it('refuses a sub-hour zone: session metrics have no minute rollup to fall back to', () => {
+  it('serves a sub-hour zone from the session facts, both layers', () => {
     const r = resolveSession({
       from: '2026-07-23T00:00:00.000Z',
       to: '2026-07-23T06:00:00.000Z',
       timezone: KOLKATA,
     })
+    expect(r.servable).toBe(true)
+    if (!r.servable) return
+    // Both layers, and the same operation for each: the finalized rollup is
+    // computed from these facts, and `splitSessionRange` gives the two calls
+    // disjoint ranges, so reading facts twice cannot double-count.
+    expect(r.finalizedOperation).toBe('analytics.sessions_raw_hour')
+    expect(r.provisionalOperation).toBe('analytics.sessions_raw_hour')
+    expect(r.withTimezone).toBe(true)
+    // Never a rollup operation: those bucket on UTC hours this zone does not share.
+    expect(r.finalizedOperation).not.toMatch(/_finalized_|_provisional_/)
+  })
+
+  it('serves a sub-hour zone at day grain from the same facts', () => {
+    const r = resolveSession({
+      // ~60 days: past the minute/hour tier, inside the 92-day raw cap.
+      from: '2026-05-01T00:00:00.000Z',
+      to: '2026-06-30T00:00:00.000Z',
+      timezone: KOLKATA,
+    })
+    expect(r.servable).toBe(true)
+    if (!r.servable) return
+    expect(r.grain).toBe('day')
+    expect(r.finalizedOperation).toBe('analytics.sessions_raw_day')
+  })
+
+  it('still refuses a sub-hour zone past the raw-scan cap', () => {
+    const r = resolveSession({
+      from: '2026-01-01T00:00:00.000Z',
+      to: '2026-07-01T00:00:00.000Z',
+      timezone: KOLKATA,
+    })
     expect(r.servable).toBe(false)
     if (r.servable) return
-    expect(r.reason).toMatch(/sub-hour|minute rollup/)
+    expect(r.reason).toMatch(/raw-scan cap/)
   })
 })
