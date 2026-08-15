@@ -99,20 +99,56 @@ const CATALOG_ROWS = new Set(Object.values(LOGOS).map((logo) => logo.src)).size;
  * reconstruct from memory. The *why* column is what stops the list reading as
  * an over-broad ask.
  */
-const STRIPE_PERMISSIONS: Array<[string, string]> = [
-  ["Charges", "Amounts, currency, status, refund linkage"],
-  ["Refunds", "So a refund lands in its own bucket"],
-  ["Disputes", "Chargebacks; funds withdrawn and reinstated"],
-  ["Customers", "Metadata used to match a payment to a visitor"],
-  ["Checkout Sessions", "`client_reference_id`, the second matching signal"],
-  ["PaymentIntents", "Order identity across charge retries"],
-  ["Invoices", "Subscription revenue context"],
-  ["Subscriptions", "Plan and product context"],
-  ["Products", "Display names for product breakdowns"],
-  ["Prices", "Display names for product breakdowns"],
-  ["Balance transactions", "Provider fees"],
-  ["Events", "Backfill verification window"],
+const STRIPE_PERMISSIONS: Array<[string, string, string]> = [
+  ["Charges", "Amounts, currency, status, refund linkage", "rak_charge_read"],
+  ["Refunds", "So a refund lands in its own bucket", "rak_refund_read"],
+  [
+    "Disputes",
+    "Chargebacks; funds withdrawn and reinstated",
+    "rak_dispute_read",
+  ],
+  [
+    "Customers",
+    "Metadata used to match a payment to a visitor",
+    "rak_customer_read",
+  ],
+  [
+    "Checkout Sessions",
+    "`client_reference_id`, the second matching signal",
+    "rak_checkout_session_read",
+  ],
+  [
+    "PaymentIntents",
+    "Order identity across charge retries",
+    "rak_payment_intent_read",
+  ],
+  ["Invoices", "Subscription revenue context", "rak_invoice_read"],
+  ["Subscriptions", "Plan and product context", "rak_subscription_read"],
+  ["Products", "Display names for product breakdowns", "rak_product_read"],
+  ["Prices", "Display names for product breakdowns", "rak_price_read"],
+  ["Balance transactions", "Provider fees", "rak_balance_transaction_read"],
+  ["Events", "Backfill verification window", "rak_event_read"],
 ];
+
+/**
+ * Stripe's create-key screen with the twelve permissions pre-selected.
+ *
+ * Built from `STRIPE_PERMISSIONS` rather than written out, so the link and the
+ * list rendered below it cannot drift: adding a resource to that array ticks it
+ * in Stripe's form and shows it to the customer in the same edit.
+ *
+ * **The query parameters are undocumented.** Stripe has never published them and
+ * has changed this screen before, so they may stop being honoured without
+ * notice. That is survivable here only because the full list stays on screen
+ * underneath: if the prefill silently stops working, the customer is looking at
+ * exactly the twelve rows they need to tick by hand. A link like this in a
+ * dialog that did NOT show the list would be the bad version — one grant short
+ * is a connection that probes fine and under-reports for ever.
+ */
+const STRIPE_CREATE_KEY_URL = `https://dashboard.stripe.com/apikeys/create?${new URLSearchParams([
+  ["name", "OpenAnalytics"],
+  ...STRIPE_PERMISSIONS.map(([, , token]): [string, string] => ["permissions[]", token]),
+]).toString()}`;
 
 /**
  * The webhook endpoint's event subscription, verbatim from the connect guide
@@ -674,16 +710,16 @@ function ConnectProviderFlow({
               follows whichever mode the customer is signed into,
               so a sandbox key is one click from here too.
 
-              Deliberately NOT a link that pre-ticks the
-              permissions: Stripe documents no query parameters for
-              that screen, and a guessed one that silently opens an
-              empty form is worse than no link at all. The
-              supported way to skip the checkboxes is a published
-              Stripe App, which mints the key already scoped. */}
+              The permissions ride along as query parameters, so
+              the form opens with the twelve boxes already ticked.
+              They are undocumented and Stripe may drop them at any
+              release — see STRIPE_CREATE_KEY_URL, which is why the
+              full list stays visible below rather than being
+              replaced by the link. */}
           {provider.id === "stripe" ? (
             <a
               className="text-xs font-medium text-primary underline-offset-4 hover:underline"
-              href="https://dashboard.stripe.com/apikeys/create"
+              href={STRIPE_CREATE_KEY_URL}
               rel="noreferrer noopener"
               target="_blank"
             >
