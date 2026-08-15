@@ -32,26 +32,49 @@ import { isValidTimezone, type Resolution } from '@openanalytics/contracts'
  * be split to honour it. The minute rollup (`metrics_1m`) aligns to any
  * whole-minute offset and every IANA offset is a whole number of minutes, so it
  * could compose sub-hour local hours/days — but only `metrics` has a minute
- * rollup, and a minute scan over a long range is not affordable. Rather than
- * return misattributed buckets, this function reports such combinations as
- * **not servable** and names why; the caller surfaces that instead of a wrong
- * number.
+ * rollup, so it cannot answer for the other nine families.
+ *
+ * What every family *does* have is `events_raw`, which stores `occurred_at` as a
+ * `DateTime64(3, 'UTC')` and is ordered `(site_id, occurred_at, event_id)`. A
+ * whole-minute offset applied to an instant is exact, so
+ * `toStartOfHour(toTimeZone(occurred_at, {tz:String}))` cuts a correct local
+ * bucket for *any* IANA zone — the same read Plausible does, and the reason it
+ * has no alignment classes to speak of. What it costs is a row scan instead of a
+ * bucket scan, which is why {@link AnalyticsQueryConfig.MAX_SPAN_RAW_DAYS} caps
+ * it far below the rollup spans rather than letting a year of a busy site
+ * through.
+ *
+ * So a sub-hour zone is served from raw within that cap and refused beyond it,
+ * with the reason naming the cap. Previously it was refused outright, which read
+ * to a viewer in Asia/Kolkata (a fifth of the planet) as a broken dashboard: the
+ * timezone picker offers the zone, and every chart then fails. Returning
+ * misattributed buckets is still never an option — that is what the rollup path
+ * cannot do and why this seam exists at all.
  *
  * The rule this encodes, therefore:
  *
- * | timezone class | minute grain | hour grain | day grain            |
- * |----------------|--------------|------------|----------------------|
- * | UTC            | `metrics_1m` | `*_1h`     | `*_1d` (direct)      |
- * | whole-hour     | `metrics_1m` | `*_1h`     | `*_1h` via toStartOfDay(tz) |
- * | sub-hour       | `metrics_1m` | not served | not served           |
+ * | timezone class | minute grain | hour grain   | day grain            |
+ * |----------------|--------------|--------------|----------------------|
+ * | UTC            | `metrics_1m` | `*_1h`       | `*_1d` (direct)      |
+ * | whole-hour     | `metrics_1m` | `*_1h`       | `*_1h` via toStartOfDay(tz) |
+ * | sub-hour       | `metrics_1m` | `events_raw` | `events_raw`         |
  *
  * Timezone is never spliced into SQL here: this module only *classifies* the
  * zone and picks a resolution. The gateway binds the zone as a `{tz:String}`
  * parameter (docs snapshot 02 §18).
  */
 
-/** Which rollup table family answers the query. */
-export const ROLLUP_RESOLUTIONS = ['1m', '1h', '1d'] as const
+/**
+ * Which source answers the query.
+ *
+ * `raw` is not a rollup: it is `events_raw` itself, read with
+ * `toStartOfHour(toTimeZone(occurred_at, {tz:String}))`. It exists for the one
+ * class no rollup can serve honestly — a sub-hour zone (see the class table
+ * above) — where the alternative is not a cheaper answer but a wrong one. It is
+ * span-capped harder than any rollup because it scans rows rather than buckets,
+ * and a caller that lands on it is told so via {@link QueryResolution.reason}.
+ */
+export const ROLLUP_RESOLUTIONS = ['1m', '1h', '1d', 'raw'] as const
 export type RollupResolution = (typeof ROLLUP_RESOLUTIONS)[number]
 
 /** How the requested zone's UTC offset aligns to rollup bucket boundaries. */
@@ -93,6 +116,18 @@ export const analyticsQueryConfigSchema = z
     MAX_SPAN_HOUR_DAYS: z.coerce.number().int().min(1).max(1_000).default(400),
     /** Hard cap on a day-rollup scan — the "all time" ceiling for UTC sites. */
     MAX_SPAN_DAY_DAYS: z.coerce.number().int().min(1).max(36_600).default(3_660),
+    /**
+     * Hard cap on a raw-events scan, the sub-hour zone's only source.
+     *
+     * Deliberately the tightest cap here: this reads rows, not buckets, so its
+     * cost scales with a site's traffic rather than with elapsed time. 92 days
+     * covers the dashboard's "today", 7d, 30d and 90d presets — every range a
+     * sub-hour viewer reaches by clicking rather than by hand — and refuses the
+     * 6-month/1-year/all presets, where a busy site would turn one chart into a
+     * multi-hundred-million-row scan. A self-hoster who knows their volume can
+     * raise it; the default protects the person who does not.
+     */
+    MAX_SPAN_RAW_DAYS: z.coerce.number().int().min(1).max(3_660).default(92),
   })
   .superRefine((config, ctx) => {
     // A grain can only be offered up to the span its own source rollup is
@@ -299,6 +334,49 @@ export interface QueryResolution {
 }
 
 /**
+ * The sub-hour answer, shared by automatic and forced selection so both refuse
+ * at exactly the same span — a forced grain must never reach a source the
+ * automatic ladder would have declined.
+ *
+ * `composeDayFromHour` stays `false` for every grain here, including `day`: that
+ * flag means "compose local days over an *hour rollup*", and a raw read has no
+ * hour buckets to compose from. It cuts the local day straight off `occurred_at`
+ * instead, so a gateway branching on the flag would build the wrong query.
+ */
+function serveRaw(
+  grain: Resolution,
+  alignment: TimezoneAlignment,
+  spanMs: number,
+  spanDays: number,
+  config: AnalyticsQueryConfig,
+): QueryResolution {
+  if (spanDays > config.MAX_SPAN_RAW_DAYS) {
+    return {
+      grain,
+      sourceRollup: 'raw',
+      composeDayFromHour: false,
+      timezoneAlignment: alignment,
+      requestedSpanMs: spanMs,
+      servable: false,
+      reason:
+        `${grain} grain in a sub-hour timezone reads raw events, and span ${spanDays.toFixed(1)}d ` +
+        `exceeds the ${config.MAX_SPAN_RAW_DAYS}d raw-scan cap`,
+    }
+  }
+  return {
+    grain,
+    sourceRollup: 'raw',
+    composeDayFromHour: false,
+    timezoneAlignment: alignment,
+    requestedSpanMs: spanMs,
+    servable: true,
+    // A caveat, not a refusal: the answer is correct, and the caller may want to
+    // know it cost a row scan — the freshness/telemetry surfaces read this.
+    reason: 'sub-hour timezone offset: served from raw events rather than a rollup',
+  }
+}
+
+/**
  * Picks the rollup resolution for a `[from, to)` range in an IANA timezone.
  *
  * Pure and total: it never throws. An inverted or malformed range comes back
@@ -382,10 +460,7 @@ export function chooseResolution(
 
   if (grain === 'hour') {
     if (alignment === 'sub-hour') {
-      return notServable(
-        'hour grain cannot be aligned to a sub-hour timezone offset from UTC-hour rollups; ' +
-          'use minute grain for a shorter range',
-      )
+      return serveRaw(grain, alignment, spanMs, spanDays, config)
     }
     if (spanDays > config.MAX_SPAN_HOUR_DAYS) {
       return notServable(
@@ -404,9 +479,7 @@ export function chooseResolution(
 
   // grain === 'day'
   if (alignment === 'sub-hour') {
-    return notServable(
-      'day grain cannot be aligned to a sub-hour timezone offset from UTC-hour rollups',
-    )
+    return serveRaw(grain, alignment, spanMs, spanDays, config)
   }
 
   if (alignment === 'utc') {
@@ -477,7 +550,7 @@ export function chooseResolution(
  * |----------------|------------------------------------------------|
  * | UTC            | `metrics_1d`, grouped by `toStartOfWeek(…, 1)` |
  * | whole-hour     | `metrics_1h`, grouped by the local Monday      |
- * | sub-hour       | not served — same reason day is not            |
+ * | sub-hour       | `events_raw`, grouped by the local Monday      |
  *
  * A UTC week always starts on a UTC midnight, so the day rollup's buckets nest
  * inside it exactly; a non-UTC week starts on a local midnight, which only the
@@ -555,10 +628,7 @@ export function resolveForcedGrain(
 
   if (requested === 'hour') {
     if (alignment === 'sub-hour') {
-      return refuse(
-        'hour grain cannot be aligned to a sub-hour timezone offset from UTC-hour rollups; ' +
-          'use minute grain for a shorter range',
-      )
+      return serveRaw(requested, alignment, spanMs, spanDays, config)
     }
     if (spanDays > config.MAX_SPAN_HOUR_DAYS) {
       return refuse(
@@ -570,9 +640,11 @@ export function resolveForcedGrain(
 
   // day and week share their sources and therefore their class rules.
   if (alignment === 'sub-hour') {
-    return refuse(
-      `${requested} grain cannot be aligned to a sub-hour timezone offset from UTC-hour rollups`,
-    )
+    // Week reaches raw on the same terms as day. `toStartOfWeek(toTimeZone(…), 1)`
+    // needs no bucket to nest inside, so the ISO week is the one grain a raw read
+    // serves *more* cheaply than the rollup path does — it never had a week
+    // rollup to miss.
+    return serveRaw(requested, alignment, spanMs, spanDays, config)
   }
 
   if (alignment === 'utc') {

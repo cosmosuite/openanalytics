@@ -68,7 +68,7 @@ const CREATE_TABLE =
  * exists to catch. The optional middle segment fixes it, and the test below
  * pins the behaviour so nobody "corrects" it back.
  */
-const REVENUE_ROLLUP = /^revenue_(?:.*_)?1[hd]$/
+const REVENUE_ROLLUP = /^revenue_(?:.*_)?1[hdm]$/
 
 const FACT_TABLE = 'revenue_events'
 
@@ -129,7 +129,11 @@ describe('revenue migration order (plan 04 M12, acceptance criterion 4)', () => 
     // Written out because the ADR's own `revenue_.*(_1h|_1d)` wording does NOT
     // match `revenue_1h` — see the pattern's comment. Without these four lines
     // the whole guard would pass forever while catching nothing.
-    for (const table of ['revenue_1h', 'revenue_1d', 'revenue_net_1d']) {
+    // `revenue_1m` (0022) is in the pattern for the same reason the other two
+    // are: it is a rollup of the same facts, written by the same generation
+    // swap, and a future edit that made it a materialized view or landed it
+    // before 0016 would be the same defect this guard exists to catch.
+    for (const table of ['revenue_1h', 'revenue_1d', 'revenue_1m', 'revenue_net_1d']) {
       expect(REVENUE_ROLLUP.test(table), table).toBe(true)
     }
     for (const table of ['revenue_events', 'revenue_attributions', 'metrics_1h']) {

@@ -604,9 +604,6 @@ describe('analytics read authorization', () => {
     it('400 RESOLUTION_NOT_AVAILABLE for a real grain this range or zone cannot carry', async () => {
       const app = authorized()
       const refused: [string, string][] = [
-        // A sub-hour zone has no honest hour/day/week answer.
-        [seriesUrl('timezone=Asia/Kathmandu&resolution=week'), 'sub-hour week'],
-        [seriesUrl('timezone=Asia/Kathmandu&resolution=day'), 'sub-hour day'],
         // 90 days of minute buckets is far past the minute rollup's scan cap.
         [seriesUrl('timezone=UTC&resolution=minute'), 'minute over a quarter'],
         // The day rollup buckets on UTC midnight, so a +03:00 zone cannot use it.
@@ -620,6 +617,23 @@ describe('analytics read authorization', () => {
       }
       // Resolution is decided before any gateway call, forced or not.
       expect(gatewayCalls).toHaveLength(0)
+    })
+
+    it('serves a forced day and week in a sub-hour zone from the raw operations', async () => {
+      // These two were refusals until the raw chart existed. They are served now,
+      // and the assertion is the *operation*: a 200 from `timeseries_day`/`_week`
+      // would be UTC-bucketed numbers wearing +05:45 labels, which is the failure
+      // the refusal was protecting against.
+      const app = authorized()
+      for (const [url, operation] of [
+        [seriesUrl('timezone=Asia/Kathmandu&resolution=week'), 'analytics.timeseries_raw_week'],
+        [seriesUrl('timezone=Asia/Kathmandu&resolution=day'), 'analytics.timeseries_raw_day'],
+      ] as [string, string][]) {
+        gatewayCalls.length = 0
+        const res = await app.fetch(new Request(url))
+        expect(res.status, operation).toBe(200)
+        expect(gatewayCalls, operation).toContain(operation)
+      }
     })
 
     it('is documented on both endpoints, with week only on the bucketed one', async () => {
@@ -638,13 +652,32 @@ describe('analytics read authorization', () => {
     })
   })
 
-  it('400 RESOLUTION_NOT_AVAILABLE for a sub-hour timezone at hour grain', async () => {
+  it('200 for a sub-hour timezone within the raw cap, answered from raw events', async () => {
     const app = buildApp(true)
     membership.value = { role: 'viewer', isBillingOwner: false }
     siteBasics.value = { siteId: SITE, slug: 's', name: 'S', status: 'active' }
     const res = await app.fetch(
       new Request(
         `http://api.test/v1/sites/${SITE}/analytics/overview?from=2026-07-16T00:00:00.000Z&to=2026-07-23T00:00:00.000Z&timezone=Asia/Kolkata`,
+      ),
+    )
+    expect(res.status).toBe(200)
+    // Which operation answered is the contract here, not just the status: a 200
+    // produced by `overview_raw` is the local boundary honoured, while a 200
+    // produced by `overview_hour` would be a +05:30 range read from UTC-hour
+    // buckets — the wrong number this endpoint used to refuse rather than give.
+    expect(gatewayCalls).toContain('analytics.overview_raw')
+    expect(gatewayCalls).not.toContain('analytics.overview_hour')
+  })
+
+  it('400 RESOLUTION_NOT_AVAILABLE for a sub-hour timezone past the raw-scan cap', async () => {
+    const app = buildApp(true)
+    membership.value = { role: 'viewer', isBillingOwner: false }
+    siteBasics.value = { siteId: SITE, slug: 's', name: 'S', status: 'active' }
+    const res = await app.fetch(
+      new Request(
+        // ~180 days: inside the hour cap, past the 92-day raw cap.
+        `http://api.test/v1/sites/${SITE}/analytics/overview?from=2026-01-01T00:00:00.000Z&to=2026-07-01T00:00:00.000Z&timezone=Asia/Kolkata`,
       ),
     )
     expect(res.status).toBe(400)

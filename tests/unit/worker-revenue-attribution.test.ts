@@ -444,7 +444,7 @@ describe('the horizon rule', () => {
     expect(read.toMs).toBeGreaterThanOrEqual(NOW + 1)
   })
 
-  it('rolls up on the same claim, over both units, from the same read', async () => {
+  it('rolls up on the same claim, over all three units, from the same read', async () => {
     // The reason the rollup is a step of this job rather than a loop of its own:
     // one ClickHouse round trip serves both the journeys and the buckets.
     const built = fakes()
@@ -454,20 +454,25 @@ describe('the horizon rule', () => {
     )
 
     expect(built.recorded.factReads).toHaveLength(1)
-    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d'])
+    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d', '1m'])
     const read = built.recorded.factReads[0]!
     for (const rollupRead of built.recorded.rollupReads) {
       expect(rollupRead.loMs).toBe(read.fromMs)
       expect(rollupRead.hiMs).toBe(read.toMs)
     }
-    // One charge, so one hour bucket and one day bucket move.
+    // One charge, so one bucket moves in each of the three units — the minute
+    // bucket included, which is what a sub-hour timezone composes its local hour
+    // and day from (migration 0022).
     expect(built.recorded.rollupWrites).toEqual([
       { unit: '1h', rows: 1 },
       { unit: '1d', rows: 1 },
+      { unit: '1m', rows: 1 },
     ])
-    // Both units carry the generation the CLAIM minted, not one derived from
-    // what is stored — the property that makes a stolen lease harmless.
-    expect(built.recorded.rollupGenerations).toEqual([7, 7])
+    // Every unit carries the generation the CLAIM minted, not one derived from
+    // what is stored — the property that makes a stolen lease harmless, and the
+    // reason the minute table can never disagree with the hourly one: they are
+    // written in the same swap, from the same plan, under the same generation.
+    expect(built.recorded.rollupGenerations).toEqual([7, 7, 7])
   })
 
   it('rolls up a window whose facts contain NO charge change at all (CP7 defect 2)', async () => {
@@ -482,11 +487,12 @@ describe('the horizon rule', () => {
 
     expect(result.attributed).toBe(1)
     expect(result.rows).toBe(0)
-    // Both units were read and both were written: the refund moved its bucket.
-    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d'])
+    // All three units were read and all three written: the refund moved its bucket.
+    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d', '1m'])
     expect(built.recorded.rollupWrites).toEqual([
       { unit: '1h', rows: 1 },
       { unit: '1d', rows: 1 },
+      { unit: '1m', rows: 1 },
     ])
     expect(advanceMock).toHaveBeenCalledTimes(1)
   })
@@ -502,7 +508,7 @@ describe('the horizon rule', () => {
       context.deps as unknown as Parameters<typeof attributeRevenueOnce>[0],
     )
 
-    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d'])
+    expect(built.recorded.rollupReads.map((read) => read.unit)).toEqual(['1h', '1d', '1m'])
     expect(advanceMock).toHaveBeenCalledTimes(1)
   })
 

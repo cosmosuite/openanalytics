@@ -58,6 +58,11 @@ const snapForRollup: Record<RollupResolution, SnapUnit> = {
   '1m': 'minute',
   '1h': 'hour',
   '1d': 'day',
+  // A raw read filters on instants, so it has no bucket boundary it must land on.
+  // It still snaps to the minute: `effective_range` is a promise about what was
+  // actually scanned, and the finest honest unit is the one every IANA offset is a
+  // whole number of.
+  raw: 'minute',
 }
 
 function snapRange(
@@ -77,6 +82,14 @@ function timeseriesOperationFor(
   sourceRollup: RollupResolution,
   composeDayFromHour: boolean,
 ): string {
+  // Raw is checked before the grain fan-out: every operation below reads a
+  // UTC-bucketed rollup, so a sub-hour request must never reach one. `minute` is
+  // absent deliberately — the ladder serves that grain from `metrics_1m`, whose
+  // buckets align to any whole-minute offset, so it never arrives here as raw.
+  if (sourceRollup === 'raw') {
+    if (grain === 'week') return 'analytics.timeseries_raw_week'
+    return grain === 'day' ? 'analytics.timeseries_raw_day' : 'analytics.timeseries_raw_hour'
+  }
   // Week has no rollup of its own — it is grouped at read time over whichever
   // family the zone allows — so the grain, not the table, names the operation.
   if (grain === 'week') {
@@ -168,6 +181,16 @@ export interface ResolvedAggregate {
 export function resolveAggregate(
   input: { from: string; to: string; timezone: string; resolution?: Resolution | undefined },
   config: AnalyticsQueryConfig = DEFAULT_ANALYTICS_QUERY_CONFIG,
+  /**
+   * Whether this surface has a raw operation to fall back on for a sub-hour zone.
+   *
+   * Opt-in per surface, and defaulting to `false`, because the raw operations are
+   * being added one family at a time: `overview` has one, the top-N reports and
+   * the custom-event samples do not yet. A surface that opts in without an
+   * operation to answer with would reach `reportOperationFor`'s throw, so the
+   * default keeps an un-migrated surface on the honest refusal it already gave.
+   */
+  options: { readonly rawCapable?: boolean } = {},
 ): ResolvedAggregate | Unservable {
   const fromMs = Date.parse(input.from)
   const toMs = Date.parse(input.to)
@@ -186,12 +209,39 @@ export function resolveAggregate(
     }
   }
 
+  // A sub-hour zone reads raw events instead. No rollup can align to its local
+  // boundaries, but `events_raw` has no boundaries to align to — it is filtered on
+  // instants and grouped by a timezone-shifted expression, which is exact for any
+  // whole-minute offset. The cap is the raw one, far below the hour cap, because
+  // this scans rows rather than buckets.
   if (alignment === 'sub-hour') {
+    if (options.rawCapable !== true) {
+      return {
+        servable: false,
+        alignment,
+        reason:
+          'a sub-hour timezone offset cannot be aligned to the hour/day rollups these totals read',
+      }
+    }
+    if (spanDays > config.MAX_SPAN_RAW_DAYS) {
+      return {
+        servable: false,
+        alignment,
+        reason:
+          `a sub-hour timezone offset reads raw events, and span ${spanDays.toFixed(1)}d exceeds ` +
+          `the ${config.MAX_SPAN_RAW_DAYS}d raw-scan cap`,
+      }
+    }
+    const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'minute')
     return {
-      servable: false,
+      servable: true,
+      // `hour` is the reported grain because these totals have no buckets and the
+      // api's response shape has to name one; the source is what actually differs.
+      grain: 'hour',
+      sourceRollup: 'raw',
       alignment,
-      reason:
-        'a sub-hour timezone offset cannot be aligned to the hour/day rollups these totals read',
+      effectiveFrom,
+      effectiveTo,
     }
   }
 
@@ -304,15 +354,32 @@ export function resolveSession(
       alignment: decision.timezoneAlignment,
     }
   }
-  // No minute session rollup exists, so a sub-hour zone (served only at minute
-  // grain for the additive family) has no honest session answer.
+  // A sub-hour zone reads `session_facts_versions` for both layers.
+  //
+  // Both, and not just the provisional one, because the finalized rollup is
+  // *computed from* those same facts by the finalizer — the facts are the source
+  // of truth, so reading them for the settled half costs a scan and changes no
+  // number. It cannot double-count either: `splitSessionRange` hands the two
+  // operations **disjoint** ranges either side of `finalized_through`, so each
+  // session is read by exactly one of them.
   if (decision.timezoneAlignment === 'sub-hour') {
+    const rawOperation =
+      decision.grain === 'day' ? 'analytics.sessions_raw_day' : 'analytics.sessions_raw_hour'
+    const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'minute')
     return {
-      servable: false,
-      alignment: 'sub-hour',
-      reason:
-        'session metrics have no minute rollup, so a sub-hour timezone offset cannot be served; ' +
-        'use a UTC or whole-hour view',
+      servable: true,
+      grain: decision.grain === 'day' ? 'day' : 'hour',
+      finalizedOperation: rawOperation,
+      provisionalOperation: rawOperation,
+      // The split boundary stays on a UTC hour while the buckets are local. A
+      // bucket straddling it is counted partly by each layer and summed back
+      // together by `mergeSessionLayers` — the same thing that already happens
+      // for a whole-hour zone's local days, whose boundaries do not land on the
+      // split either.
+      splitUnit: 'hour',
+      withTimezone: true,
+      effectiveFrom,
+      effectiveTo,
     }
   }
 
@@ -372,10 +439,30 @@ export const REPORT_SLUGS = [
 ] as const
 export type ReportSlug = (typeof REPORT_SLUGS)[number]
 
-/** The report operation ID for a resolved aggregate grain. */
+/**
+ * The report operation ID for a resolved aggregate grain.
+ *
+ * `raw` throws rather than falling through to the hour operation, and that is the
+ * point: `_hour` reads `metrics_*_1h`, whose UTC-hour buckets are the thing a
+ * sub-hour zone cannot align to. A fall-through here would answer a +05:30
+ * request from misattributed buckets — a plausible wrong number instead of a
+ * refusal, which is the one outcome this whole seam exists to prevent. The raw
+ * report operations are not built yet; until they are, the caller must refuse.
+ */
 export function reportOperationFor(slug: ReportSlug, sourceRollup: RollupResolution): string {
+  if (sourceRollup === 'raw') return `analytics.${slug}_raw`
   return `analytics.${slug}_${sourceRollup === '1d' ? 'day' : 'hour'}`
 }
+
+/**
+ * The reports that can answer a sub-hour zone — all six.
+ *
+ * `performance` is in the set despite having no `performance_events` source of
+ * its own: `performance_1h_mv` reads `events_raw WHERE type = 'web_vital'` and
+ * pulls the metric, value and rating out of `properties`, so the raw operation
+ * reads exactly what the rollup was built from.
+ */
+export const RAW_REPORT_SLUGS: ReadonlySet<ReportSlug> = new Set(REPORT_SLUGS)
 
 /**
  * The custom-event sample operation for a resolved aggregate grain (ADR-0038,
@@ -391,6 +478,9 @@ export function reportOperationFor(slug: ReportSlug, sourceRollup: RollupResolut
  * the statements.
  */
 export function customEventSamplesOperationFor(sourceRollup: RollupResolution): string {
+  if (sourceRollup === 'raw') {
+    throw new Error('custom-event samples have no raw operation (see reportOperationFor)')
+  }
   return sourceRollup === '1d'
     ? 'analytics.custom_event_samples_day'
     : 'analytics.custom_event_samples_hour'
@@ -398,6 +488,7 @@ export function customEventSamplesOperationFor(sourceRollup: RollupResolution): 
 
 /** The overview operation ID for a resolved aggregate grain. */
 export function overviewOperationFor(sourceRollup: RollupResolution): string {
+  if (sourceRollup === 'raw') return 'analytics.overview_raw'
   return sourceRollup === '1d' ? 'analytics.overview_day' : 'analytics.overview_hour'
 }
 
@@ -420,6 +511,9 @@ export function overviewOperationFor(sourceRollup: RollupResolution): string {
  */
 export const IMPORT_AWARE_OPERATIONS: ReadonlySet<string> = new Set([
   'analytics.timeseries_minute',
+  'analytics.timeseries_raw_day',
+  'analytics.timeseries_raw_hour',
+  'analytics.timeseries_raw_week',
   'analytics.timeseries_hour',
   'analytics.timeseries_day',
   'analytics.timeseries_day_utc',
@@ -427,20 +521,26 @@ export const IMPORT_AWARE_OPERATIONS: ReadonlySet<string> = new Set([
   'analytics.timeseries_week_utc',
   'analytics.overview_day',
   'analytics.overview_hour',
+  'analytics.overview_raw',
   // The live breakdowns take the cutover but no union: their imported rows
   // arrive through the `analytics.imported_*` operations and are merged in the
   // api. `performance` is absent — no provider exports web vitals, so there is
   // nothing to partition against.
   'analytics.pages_hour',
   'analytics.pages_day',
+  'analytics.pages_raw',
   'analytics.sources_hour',
   'analytics.sources_day',
+  'analytics.sources_raw',
   'analytics.geography_hour',
   'analytics.geography_day',
+  'analytics.geography_raw',
   'analytics.devices_hour',
   'analytics.devices_day',
+  'analytics.devices_raw',
   'analytics.custom_events_hour',
   'analytics.custom_events_day',
+  'analytics.custom_events_raw',
   'analytics.imported_pages',
   'analytics.imported_sources',
   'analytics.imported_geography',
@@ -465,6 +565,7 @@ export const IMPORT_RUN_OPERATIONS: ReadonlySet<string> = new Set([
   'analytics.timeseries_week_utc',
   'analytics.overview_day',
   'analytics.overview_hour',
+  'analytics.overview_raw',
   'analytics.imported_pages',
   'analytics.imported_sources',
   'analytics.imported_geography',
@@ -503,21 +604,30 @@ export function importParamsFor(
  */
 export const TIMEZONE_OPERATIONS: ReadonlySet<string> = new Set([
   'analytics.timeseries_minute',
+  'analytics.timeseries_raw_day',
+  'analytics.timeseries_raw_hour',
+  'analytics.timeseries_raw_week',
   'analytics.timeseries_hour',
   'analytics.timeseries_day',
   'analytics.timeseries_week',
   'analytics.overview_hour',
   'analytics.overview_day',
+  'analytics.overview_raw',
   'analytics.pages_hour',
   'analytics.pages_day',
+  'analytics.pages_raw',
   'analytics.sources_hour',
   'analytics.sources_day',
+  'analytics.sources_raw',
   'analytics.geography_hour',
   'analytics.geography_day',
+  'analytics.geography_raw',
   'analytics.devices_hour',
   'analytics.devices_day',
+  'analytics.devices_raw',
   'analytics.custom_events_hour',
   'analytics.custom_events_day',
+  'analytics.custom_events_raw',
   'analytics.imported_pages',
   'analytics.imported_sources',
   'analytics.imported_geography',
@@ -528,6 +638,8 @@ export const TIMEZONE_OPERATIONS: ReadonlySet<string> = new Set([
   'analytics.sessions_finalized_hour',
   'analytics.sessions_finalized_day_local',
   'analytics.sessions_provisional_hour',
+  'analytics.sessions_raw_day',
+  'analytics.sessions_raw_hour',
   'analytics.sessions_provisional_day_local',
   // The revenue charts (CP5). Only the two that BUCKET in local time are here:
   // `revenue_timeseries_day` reads the UTC-day rollup and is only ever routed a
@@ -535,6 +647,8 @@ export const TIMEZONE_OPERATIONS: ReadonlySet<string> = new Set([
   // bound to any of the three is a "bound unused parameter" rejection.
   'analytics.revenue_timeseries_hour',
   'analytics.revenue_timeseries_day_local',
+  'analytics.revenue_timeseries_day_1m',
+  'analytics.revenue_timeseries_hour_1m',
 ])
 
 /**
@@ -649,13 +763,27 @@ export function resolveRevenue(
     }
   }
 
+  // A sub-hour zone composes from `revenue_1m` (migration 0022). The minute
+  // rollup exists precisely because this zone's local hour begins inside a UTC
+  // hour bucket that cannot be split — every IANA offset is a whole number of
+  // minutes, so a minute bucket always nests cleanly.
+  //
+  // The money rules are not restated anywhere for this path: the finalizer writes
+  // all three units in one pass from one plan, so `revenue_1m` cannot disagree
+  // with `revenue_1h` about what a refund did.
   if (decision.timezoneAlignment === 'sub-hour') {
+    const { effectiveFrom, effectiveTo } = snapRange(input.from, input.to, 'minute')
     return {
-      servable: false,
-      alignment: 'sub-hour',
-      reason:
-        'revenue has no minute rollup, so a sub-hour timezone offset cannot be served; ' +
-        'use a UTC or whole-hour view',
+      servable: true,
+      grain: decision.grain === 'day' ? 'day' : 'hour',
+      timeseriesOperation:
+        decision.grain === 'day'
+          ? 'analytics.revenue_timeseries_day_1m'
+          : 'analytics.revenue_timeseries_hour_1m',
+      summaryOperation: 'analytics.revenue_summary_1m',
+      withTimezone: true,
+      effectiveFrom,
+      effectiveTo,
     }
   }
 

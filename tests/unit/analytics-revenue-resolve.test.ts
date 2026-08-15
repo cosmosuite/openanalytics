@@ -97,17 +97,34 @@ describe('grain selection', () => {
 })
 
 describe('refusals', () => {
-  it('refuses a sub-hour timezone rather than misattributing every day edge', () => {
+  it('serves a sub-hour timezone from revenue_1m rather than misattributing every day edge', () => {
     const r = resolveRevenue({
       from: '2026-07-19T18:15:00.000Z',
       to: '2026-07-20T18:15:00.000Z',
       timezone: KATHMANDU,
     })
+    expect(r.servable).toBe(true)
+    if (!r.servable) return
+    // The minute rollup (migration 0022). +05:45's local hour begins inside a UTC
+    // hour bucket, so the hourly operations would misattribute the edge of every
+    // bucket — which is what this test was pinning before 0022 existed.
+    expect(r.timeseriesOperation).toBe('analytics.revenue_timeseries_hour_1m')
+    expect(r.summaryOperation).toBe('analytics.revenue_summary_1m')
+    expect(r.withTimezone).toBe(true)
+    expect(r.timeseriesOperation).not.toMatch(/_hour$|_day$|_day_local$/)
+  })
+
+  it('refuses a sub-hour timezone past the raw-scan cap', () => {
+    const r = resolveRevenue({
+      // ~180 days, past MAX_SPAN_RAW_DAYS (92).
+      from: '2026-01-01T00:00:00.000Z',
+      to: '2026-07-01T00:00:00.000Z',
+      timezone: KATHMANDU,
+    })
     expect(r.servable).toBe(false)
-    if (!r.servable) {
-      expect(r.alignment).toBe('sub-hour')
-      expect(r.reason).toContain('no minute rollup')
-    }
+    if (r.servable) return
+    expect(r.alignment).toBe('sub-hour')
+    expect(r.reason).toMatch(/raw-scan cap/)
   })
 
   it('refuses a forced minute or week grain', () => {

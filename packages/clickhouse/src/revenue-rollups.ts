@@ -41,8 +41,15 @@ import { createClient, type ClickHouseClient } from '@clickhouse/client'
 
 export const REVENUE_ROLLUP_1H_TABLE = 'revenue_1h'
 export const REVENUE_ROLLUP_1D_TABLE = 'revenue_1d'
+export const REVENUE_ROLLUP_1M_TABLE = 'revenue_1m'
 
-export type RevenueRollupUnit = '1h' | '1d'
+/**
+ * `'1m'` (migration 0022) is the sub-hour zone's source. Every IANA offset is a
+ * whole number of minutes, so a local hour or day composes exactly from minute
+ * buckets — which a UTC-hour bucket cannot do for +05:30, because that zone's
+ * local hour begins inside one.
+ */
+export type RevenueRollupUnit = '1h' | '1d' | '1m'
 
 /**
  * One row of `revenue_1h`/`revenue_1d` (migration 0018).
@@ -110,6 +117,7 @@ export interface RevenueRollupsStoreOptions {
   /** Overridable for tests that migrate into a throwaway database. */
   readonly rollup1hTable?: string
   readonly rollup1dTable?: string
+  readonly rollup1mTable?: string
 }
 
 export const DEFAULT_REVENUE_ROLLUP_TIMEOUT_MS = 60_000
@@ -153,10 +161,11 @@ export function revenueRollupToken(
 export function createRevenueRollupsStore(
   options: RevenueRollupsStoreOptions,
 ): RevenueRollupsStore {
-  const rollupTable = (unit: RevenueRollupUnit): string =>
-    unit === '1h'
-      ? (options.rollup1hTable ?? REVENUE_ROLLUP_1H_TABLE)
-      : (options.rollup1dTable ?? REVENUE_ROLLUP_1D_TABLE)
+  const rollupTable = (unit: RevenueRollupUnit): string => {
+    if (unit === '1h') return options.rollup1hTable ?? REVENUE_ROLLUP_1H_TABLE
+    if (unit === '1d') return options.rollup1dTable ?? REVENUE_ROLLUP_1D_TABLE
+    return options.rollup1mTable ?? REVENUE_ROLLUP_1M_TABLE
+  }
 
   const client: ClickHouseClient = createClient({
     url: options.url,

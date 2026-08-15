@@ -73,12 +73,18 @@ import type {
  * currency totals separately, from the facts.
  */
 
+const MS_PER_MINUTE = 60_000
 const MS_PER_HOUR = 3_600_000
 const MS_PER_DAY = 86_400_000
 
 export const REVENUE_ROLLUP_UNIT_MS: Readonly<Record<RevenueRollupUnit, number>> = {
   '1h': MS_PER_HOUR,
   '1d': MS_PER_DAY,
+  // The minute unit reuses every rule above unchanged — the sign convention, the
+  // refunded-charge rule, the unconverted rule. That is the point of the unit
+  // being a parameter: a second grain must never become a second opinion about
+  // what a refund does to a number.
+  '1m': MS_PER_MINUTE,
 }
 
 /**

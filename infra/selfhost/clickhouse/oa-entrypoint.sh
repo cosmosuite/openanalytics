@@ -115,6 +115,12 @@ cat >"$TARGET" <<XML
         <query>GRANT SELECT ON analytics.revenue_1h</query>
         <query>GRANT INSERT ON analytics.revenue_1d</query>
         <query>GRANT SELECT ON analytics.revenue_1d</query>
+        <!-- Minute grain (migration 0022), the sub-hour timezone's source. The
+             rollup pass writes all three units together, so a missing grant here
+             does not degrade to "no minute buckets" — it fails the whole revenue
+             rollup run, hourly and daily included. -->
+        <query>GRANT INSERT ON analytics.revenue_1m</query>
+        <query>GRANT SELECT ON analytics.revenue_1m</query>
 
         <!-- Preview and test-mode events. INSERT only: the worker writes this
              table instead of events_raw whenever an event is test_mode, and
