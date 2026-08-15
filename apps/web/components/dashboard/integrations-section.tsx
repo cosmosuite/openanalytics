@@ -99,9 +99,19 @@ const CATALOG_ROWS = new Set(Object.values(LOGOS).map((logo) => logo.src)).size;
  * reconstruct from memory. The *why* column is what stops the list reading as
  * an over-broad ask.
  */
-const STRIPE_PERMISSIONS: Array<[string, string, string]> = [
+/**
+ * The twelve resources, and the permission token that ticks each one — `null`
+ * where a row has no token of its own.
+ *
+ * Refunds is the one such row: Stripe presents "Charges and Refunds" as a single
+ * resource, which `rak_charge_read` already covers. `rak_refund_read` looks like
+ * it should exist and does not — loaded alone it ticks nothing, which is how it
+ * was found. It stays listed because the customer still needs to know refunds
+ * are read; it just contributes no parameter.
+ */
+const STRIPE_PERMISSIONS: Array<[string, string, string | null]> = [
   ["Charges", "Amounts, currency, status, refund linkage", "rak_charge_read"],
-  ["Refunds", "So a refund lands in its own bucket", "rak_refund_read"],
+  ["Refunds", "So a refund lands in its own bucket", null],
   [
     "Disputes",
     "Chargebacks; funds withdrawn and reinstated",
@@ -158,7 +168,9 @@ const STRIPE_PERMISSIONS: Array<[string, string, string]> = [
  */
 const STRIPE_CREATE_KEY_URL = `https://dashboard.stripe.com/apikeys/create?${new URLSearchParams([
   ["name", "OpenAnalytics"],
-  ...STRIPE_PERMISSIONS.map(([, , token]): [string, string] => ["permissions[]", token]),
+  ...STRIPE_PERMISSIONS.filter(([, , token]) => token !== null).map(
+    ([, , token]): [string, string] => ["permissions[]", token as string],
+  ),
 ]).toString()}`;
 
 /**
