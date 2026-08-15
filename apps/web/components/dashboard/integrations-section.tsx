@@ -125,8 +125,19 @@ const STRIPE_PERMISSIONS: Array<[string, string, string]> = [
   ["Invoices", "Subscription revenue context", "rak_invoice_read"],
   ["Subscriptions", "Plan and product context", "rak_subscription_read"],
   ["Products", "Display names for product breakdowns", "rak_product_read"],
-  ["Prices", "Display names for product breakdowns", "rak_price_read"],
-  ["Balance transactions", "Provider fees", "rak_balance_transaction_read"],
+  // `rak_plan_read`, not `rak_price_read`: the row is called Prices in the
+  // dashboard, but its permission still carries the API's original name for the
+  // object. Verified against the live create-key screen — `rak_price_read` is
+  // silently ignored and leaves the row unticked.
+  ["Prices", "Display names for product breakdowns", "rak_plan_read"],
+  // Likewise verified: the row Stripe ticks for balance transactions is
+  // "Balance Transaction Sources", and `rak_balance_transaction_read` matches
+  // nothing.
+  [
+    "Balance transactions",
+    "Provider fees",
+    "rak_balance_transaction_source_read",
+  ],
   ["Events", "Backfill verification window", "rak_event_read"],
 ];
 
