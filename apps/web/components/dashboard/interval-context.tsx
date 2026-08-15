@@ -33,6 +33,10 @@ export const INTERVALS = [
   { key: "24h", label: "Last 24 hours" },
   { key: "7d", label: "Last 7 days" },
   { key: "30d", label: "Last 30 days" },
+  // Calendar month to date, not a rolling 30 days — the two answer different
+  // questions and a dashboard that offers only the rolling one cannot be
+  // reconciled against anything billed or reported monthly.
+  { key: "month", label: "This month" },
   { key: "90d", label: "Last 90 days" },
   { key: "6mo", label: "Last 6 months" },
   { key: "12mo", label: "Last 12 months" },
@@ -153,7 +157,18 @@ function tzOffsetMs(timezone: string, at: Date): number {
 function zonedDayStart(
   base: Date,
   timezone: string,
-  shift: { years?: number; months?: number; days?: number } = {}
+  shift: {
+    years?: number
+    months?: number
+    days?: number
+    /**
+     * Absolute day of month, replacing today's rather than shifting it — the
+     * "this month" anchor. A relative `days` cannot express it: the shift needed
+     * to reach the 1st depends on today's date, which the caller does not know
+     * in the request timezone (that is the whole reason this helper exists).
+     */
+    dayOfMonth?: number
+  } = {}
 ): Date {
   const [y, m, d] = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
@@ -167,7 +182,7 @@ function zonedDayStart(
   const target = Date.UTC(
     y + (shift.years ?? 0),
     m - 1 + (shift.months ?? 0),
-    d + (shift.days ?? 0)
+    (shift.dayOfMonth ?? d) + (shift.days ?? 0)
   );
   let instant = target - tzOffsetMs(timezone, new Date(target));
   instant = target - tzOffsetMs(timezone, new Date(instant));
@@ -202,6 +217,10 @@ export function rangeForInterval(
     "24h": [new Date(now.getTime() - 86_400_000), now],
     "7d": [day({ days: -6 }), tomorrow],
     "30d": [day({ days: -29 }), tomorrow],
+    // The 1st of the current month in the request timezone, through tomorrow —
+    // month-to-date, so it grows through the month rather than being a fixed
+    // window.
+    month: [day({ dayOfMonth: 1 }), tomorrow],
     "90d": [day({ days: -89 }), tomorrow],
     "6mo": [day({ months: -6, days: 1 }), tomorrow],
     "12mo": [day({ years: -1, days: 1 }), tomorrow],
